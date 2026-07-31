@@ -14,6 +14,14 @@ descartaram alternativas mais "óbvias" por razões específicas explicadas abai
 > "Esboço do schema multi-tenant" abaixo). **As API routes ainda NÃO refletem essa mudança** —
 > `/api/participants/import` e `/api/certificates/generate` continuam assumindo uma única
 > organização implícita. Ver "Migração pendente" no fim deste arquivo para os próximos passos.
+> **Atualização (revisão de segurança do RLS):** a primeira versão do schema multi-tenant tinha
+> duas falhas de escalada de privilégio, já corrigidas: (1) `profiles` permitia que qualquer
+> usuário autenticado escrevesse o próprio `role`/`org_id` diretamente, o que permitia
+> autopromoção a `platform_admin` ou sequestro de outra organização; (2) `participants`
+> permitia `select` irrestrito para qualquer autenticado, expondo CPF/e-mail de todo mundo na
+> plataforma. Ambas foram fechadas — ver "Estratégia de isolamento (RLS)" abaixo para os
+> detalhes e o que isso muda na implementação do frontend (uso obrigatório de
+> `create_organization_and_become_admin` via RPC em vez de `insert`/`update` direto).
 
 ## O que é o projeto
 
@@ -170,6 +178,16 @@ certificates                      -- inalterado
 validation_logs                   -- inalterado
 ```
 
+Além das tabelas, `schema.sql` define:
+- **`handle_new_user()` + trigger `on_auth_user_created`**: cria automaticamente a linha em
+  `profiles` (com `role = 'participant'` por padrão) assim que alguém completa o signup no
+  Supabase Auth. Sem isso, um usuário recém-criado não tem `profile` nenhum.
+- **`create_organization_and_become_admin(org_name text)`**: function `security definer` que
+  cria a organização E promove o usuário autenticado a `org_admin` dela, atomicamente. É o
+  **único** caminho oficial para criar uma organização — não existe mais `insert` direto do
+  client em `organizations` nem escrita direta de `role`/`org_id` em `profiles` (ver abaixo).
+  O frontend chama isso via `supabase.rpc('create_organization_and_become_admin', { org_name })`.
+
 ### Estratégia de isolamento (RLS)
 
 - `profiles.org_id` é a fonte da verdade de "a qual organização este usuário pertence".
@@ -178,20 +196,36 @@ validation_logs                   -- inalterado
   `select ... from profiles` direto dentro da própria policy de `profiles` — consultar a mesma
   tabela dentro da sua própria policy causa recursão infinita no Postgres. Reusar essas funções
   em qualquer policy nova que precise saber role/organização do usuário logado.
+- **`profiles` — protegida contra autopromoção**: não existe policy de `insert` nem `update`
+  liberada para `authenticated` nas colunas `role`/`org_id`/`participant_id`. O client só tem
+  `grant update (full_name)` — pode editar o próprio nome, nada além disso. `role` e `org_id`
+  só mudam via `create_organization_and_become_admin()` (vira `org_admin`) ou manualmente pelo
+  `platform_admin`/service_role (ex: para promover a primeira conta a `platform_admin`, ou para
+  a plataforma suspender/reatribuir alguém). **Qualquer fluxo novo de frontend que precise
+  mudar `role` ou `org_id` de um usuário deve passar por uma function `security definer` nova
+  ou pela API Route com `service_role` — nunca por `update` direto do client.**
 - Policies em `events` (e por herança lógica, tudo que depende de `event_id`, como
   `inscriptions` e `certificates`): um `org_admin` só enxerga/edita linhas onde
   `events.org_id = current_profile_org_id()`. Um `platform_admin` enxerga tudo.
-- `participants`: leitura ampla é aceitável para autenticados (é a identidade global), mas
-  escrita continua reservada às API Routes com `service_role` (que ignora RLS por definição) —
-  não há policy de `insert`/`update` para o client. Dados sensíveis (CPF completo, por exemplo)
-  devem continuar sendo mascarados nas API Routes, como já documentado na seção de LGPD do PDF
-  original. **Importante:** `participants.email` agora tem constraint `unique` no banco (é a
-  chave de identidade global) — `/api/participants/import` precisa virar um `upsert` (`on
-  conflict (email) do update`) em vez de `insert` puro, senão vai quebrar ao importar um CSV com
-  um e-mail que já existe de outra organização. Isso ainda não foi feito (ver item 3 da
-  Migração pendente).
-- `organizations`: qualquer usuário autenticado pode fazer `insert` (fluxo de self-serve).
-  `select`/`update` restrito ao próprio `org_admin` daquela organização + `platform_admin`.
+- **`participants` — leitura restrita, não mais aberta**: só enxerga um participante quem é
+  `platform_admin`, o próprio participante logado (via `profiles.participant_id`), ou um
+  `org_admin` de uma organização onde esse participante está inscrito em algum evento seu. A
+  versão anterior deste documento dizia "leitura ampla é aceitável para autenticados" — isso
+  foi corrigido: leitura ampla expunha CPF/e-mail de todo mundo na plataforma para qualquer
+  usuário logado, o que conflita com a seção de LGPD do PDF original. Escrita continua
+  reservada às API Routes com `service_role` (que ignora RLS por definição) — não há policy de
+  `insert`/`update` para o client. **Importante:** `participants.email` tem constraint `unique`
+  no banco (é a chave de identidade global) — `/api/participants/import` precisa virar um
+  `upsert` (`on conflict (email) do update`) em vez de `insert` puro, senão vai quebrar ao
+  importar um CSV com um e-mail que já existe de outra organização. Isso ainda não foi feito
+  (ver item 3 da Migração pendente).
+- **`organizations` — sem `insert` direto do client**: a versão anterior deste documento dizia
+  "qualquer usuário autenticado pode fazer `insert`" — isso foi corrigido porque um `insert`
+  direto deixava a organização nascer sem nenhum `org_admin` vinculado (ou permitia vincular
+  qualquer usuário a qualquer org via manipulação do payload). Criação de organização agora
+  passa exclusivamente pela function `create_organization_and_become_admin()` descrita acima.
+  `select`/`update` continuam restritos ao próprio `org_admin` daquela organização +
+  `platform_admin`.
 - `validation_logs`: nenhuma policy para `authenticated`/`anon` — só a `service_role` acessa,
   igual ao comportamento do schema single-tenant original.
 
@@ -279,9 +313,12 @@ Multi-tenant e os 3 níveis de login foram aprovados — isso NÃO reabre os ite
 - **Schema do banco no formato multi-tenant** (`supabase/schema.sql`): `organizations`,
   `profiles` (com `role`/`org_id`/`participant_id`), `org_id` obrigatório em `events`,
   `participants.email` com constraint `unique`, funções `security definer`
-  (`current_profile_role()`, `current_profile_org_id()`) e as policies de RLS descritas em
-  "Estratégia de isolamento" acima. **Ainda não rodado/testado contra um projeto Supabase
-  real** — só escrito e revisado, não aplicado via SQL Editor nem validado com dados de teste.
+  (`current_profile_role()`, `current_profile_org_id()`, `create_organization_and_become_admin()`),
+  a trigger `handle_new_user` e as policies de RLS descritas em "Estratégia de isolamento"
+  acima — já revisadas para fechar as duas brechas de escalada de privilégio da primeira
+  versão (`profiles` gravável pelo próprio client, `participants` com leitura irrestrita).
+  **Ainda não rodado/testado contra um projeto Supabase real** — só escrito e revisado, não
+  aplicado via SQL Editor nem validado com dados de teste.
 - Rota de import de participantes via CSV (`/api/participants/import`) — build passa
   (`npm run build` ✅), mas **ainda no formato single-tenant**: não resolve `org_id`, não filtra
   por organização, e faz `insert` puro (vai quebrar contra o novo `participants.email unique`
@@ -298,11 +335,20 @@ Schema já migrado (item 1 concluído). O restante do código ainda assume uma �
 implícita. Antes de construir o dashboard, a ordem recomendada é:
 
 1. ~~Atualizar `supabase/schema.sql`~~ ✅ feito — ver "Feito" acima. Falta rodar no SQL Editor
-   de um projeto Supabase real para validar que as policies funcionam como esperado.
-2. **Configurar Supabase Auth** no projeto (e-mail/senha ou magic link) e criar o fluxo de
-   signup que cria `profiles` + `organizations` atomicamente (ver seção de self-serve acima).
-   Recomendado usar uma função Postgres (`security definer`) ou uma API Route com
-   `service_role` para essa operação atômica, já que envolve duas tabelas.
+   de um projeto Supabase real para validar que as policies funcionam como esperado. Roteiro de
+   teste sugerido: criar usuário via Auth → confirmar que nasceu `profile` com
+   `role = 'participant'` → promover manualmente esse usuário a `platform_admin` (via SQL
+   Editor, update direto) → com um segundo usuário de teste, chamar
+   `create_organization_and_become_admin('Organização Teste')` via `supabase.rpc(...)` e
+   confirmar que ele virou `org_admin` da org nova.
+2. **Configurar Supabase Auth** no projeto (e-mail/senha ou magic link). A parte de banco desse
+   item já está pronta (trigger `handle_new_user` + função `create_organization_and_become_admin`
+   em `schema.sql`) — o que falta é: (a) habilitar o provider certo nas configurações de Auth do
+   Supabase, e (b) construir a tela de onboarding no frontend que, após o login/signup, chama
+   `supabase.rpc('create_organization_and_become_admin', { org_name })` quando o usuário ainda
+   não tem `org_id` (`profiles.org_id is null`). **Não implementar esse fluxo via `insert`/
+   `update` direto nas tabelas** — a RPC existe exatamente para evitar isso (ver "Estratégia de
+   isolamento (RLS)" acima).
 3. **Atualizar `/api/participants/import` e `/api/certificates/generate`** para receberem o
    usuário autenticado, resolverem o `org_id` via `profiles`, e validarem que o `eventId`
    pertence àquela organização antes de agir (hoje essas rotas não checam organização nenhuma).

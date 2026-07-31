@@ -1,6 +1,9 @@
 -- ============================================================
 -- Schema multi-tenant para Certifica Fácil
--- Rode este arquivo no SQL Editor do seu projeto Supabase
+-- Rode este arquivo INTEIRO no SQL Editor do seu projeto Supabase.
+-- Se você já rodou uma versão anterior deste schema, apague as
+-- tabelas antigas primeiro (ver README.md / CLAUDE.md, seção de
+-- reset do banco) antes de rodar este arquivo.
 -- ============================================================
 
 create extension if not exists "pgcrypto";
@@ -126,6 +129,62 @@ as $$
 $$;
 
 -- ------------------------------------------------------------
+-- Criação automática de perfil no signup.
+-- Sem isso, um usuário criado via Supabase Auth não ganha uma
+-- linha correspondente em `profiles` (e não pode mais criar essa
+-- linha ele mesmo — ver revoke/grant de `profiles` mais abaixo).
+-- ------------------------------------------------------------
+create or replace function handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.profiles (id, email)
+  values (new.id, new.email);
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function handle_new_user();
+
+-- ------------------------------------------------------------
+-- Criação de organização + promoção atômica a org_admin.
+-- security definer permite que esta função escreva `role` e
+-- `org_id` em `profiles` mesmo o client não tendo permissão
+-- direta de UPDATE nessas colunas (ver grant/revoke abaixo).
+-- Chamar via supabase.rpc('create_organization_and_become_admin',
+-- { org_name: '...' }) no frontend.
+-- ------------------------------------------------------------
+create or replace function create_organization_and_become_admin(org_name text)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  new_org_id uuid;
+begin
+  if exists (select 1 from profiles where id = auth.uid() and org_id is not null) then
+    raise exception 'Usuário já pertence a uma organização.';
+  end if;
+
+  insert into organizations (name) values (org_name) returning id into new_org_id;
+
+  update profiles
+    set role = 'org_admin', org_id = new_org_id
+    where id = auth.uid();
+
+  return new_org_id;
+end;
+$$;
+
+grant execute on function create_organization_and_become_admin(text) to authenticated;
+
+-- ------------------------------------------------------------
 -- Row Level Security
 -- ------------------------------------------------------------
 alter table organizations enable row level security;
@@ -136,13 +195,11 @@ alter table inscriptions enable row level security;
 alter table certificates enable row level security;
 alter table validation_logs enable row level security;
 
--- organizations: qualquer autenticado pode criar (fluxo self-serve).
--- select/update restrito ao próprio org_admin daquela organização + platform_admin.
-create policy "insert organizacao autenticado"
-  on organizations for insert
-  to authenticated
-  with check (true);
-
+-- organizations: o INSERT direto do client fica bloqueado — a
+-- criação de organização passa exclusivamente pela função
+-- create_organization_and_become_admin (acima), que já garante
+-- que ela nasce vinculada a um org_admin. Sem policy de insert
+-- para "authenticated", nenhuma linha nova entra fora da função.
 create policy "select organizacao propria"
   on organizations for select
   to authenticated
@@ -157,22 +214,36 @@ create policy "update organizacao propria"
   using (id = current_profile_org_id() and current_profile_role() = 'org_admin')
   with check (id = current_profile_org_id() and current_profile_role() = 'org_admin');
 
--- profiles: cada usuário vê/edita o próprio perfil; platform_admin vê todos
+-- profiles: leitura do próprio perfil (ou tudo, se platform_admin).
+-- ATENÇÃO: não existe policy de INSERT nem de UPDATE liberada para
+-- authenticated aqui de propósito. `role` e `org_id` são as colunas
+-- que definem privilégio no sistema inteiro — se o client pudesse
+-- escrever nelas livremente, qualquer usuário autenticado poderia
+-- se autopromover a platform_admin ou assumir outra organização.
+-- A única forma de sair de "participant" é via
+-- create_organization_and_become_admin() (org_admin) ou uma ação
+-- manual do platform_admin (ver nota abaixo).
+
 create policy "select proprio perfil"
   on profiles for select
   to authenticated
   using (id = auth.uid() or current_profile_role() = 'platform_admin');
 
-create policy "update proprio perfil"
+-- Só a coluna full_name pode ser editada diretamente pelo dono do
+-- perfil. role/org_id/participant_id ficam de fora do grant.
+revoke update on profiles from authenticated;
+grant update (full_name) on profiles to authenticated;
+
+create policy "update proprio nome"
   on profiles for update
   to authenticated
   using (id = auth.uid())
   with check (id = auth.uid());
 
-create policy "insert proprio perfil"
-  on profiles for insert
-  to authenticated
-  with check (id = auth.uid());
+-- platform_admin promovendo/editando qualquer perfil (ex: suspender
+-- uma organização mudando o role de alguém) continua possível via
+-- service_role nas API Routes, que ignora RLS por definição — não
+-- precisa de policy adicional aqui para isso.
 
 -- events: isolamento por organização
 create policy "org admin gerencia eventos"
@@ -181,12 +252,24 @@ create policy "org admin gerencia eventos"
   using (org_id = current_profile_org_id() or current_profile_role() = 'platform_admin')
   with check (org_id = current_profile_org_id() or current_profile_role() = 'platform_admin');
 
--- participants: identidade global — leitura ampla para autenticados;
--- escrita continua reservada às API Routes (service_role, ignora RLS).
-create policy "select participantes"
+-- participants: identidade global, mas a LEITURA não pode ser
+-- irrestrita (CPF e e-mail de todo mundo na plataforma). Só enxerga
+-- um participante quem: é platform_admin, é o próprio participante
+-- logado, ou é org_admin de uma organização que tem esse participante
+-- inscrito em algum evento seu.
+create policy "select participantes acessiveis"
   on participants for select
   to authenticated
-  using (true);
+  using (
+    current_profile_role() = 'platform_admin'
+    or id = (select participant_id from profiles where id = auth.uid())
+    or exists (
+      select 1 from inscriptions
+      join events on events.id = inscriptions.event_id
+      where inscriptions.participant_id = participants.id
+        and events.org_id = current_profile_org_id()
+    )
+  );
 
 -- inscriptions: isolamento herdado via events.org_id
 create policy "org admin gerencia inscricoes"
@@ -239,3 +322,14 @@ create policy "org admin gerencia certificados"
 
 -- validation_logs: sem policy para authenticated/anon —
 -- só a service_role (API routes) acessa, igual ao comportamento anterior.
+
+-- ------------------------------------------------------------
+-- Nota sobre o primeiro platform_admin
+-- ------------------------------------------------------------
+-- Não existe fluxo de auto-cadastro para platform_admin (é você).
+-- Depois de criar sua própria conta pelo signup normal (o que a
+-- deixa como 'participant' por padrão via trigger), promova-se
+-- manualmente UMA vez, direto no SQL Editor (que roda como
+-- superusuário do Postgres e ignora RLS):
+--
+--   update profiles set role = 'platform_admin' where email = 'seu-email@exemplo.com';
