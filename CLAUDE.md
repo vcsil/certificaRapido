@@ -9,8 +9,11 @@ descartaram alternativas mais "óbvias" por razões específicas explicadas abai
 > possibilidade de virar SaaS no futuro**. Isso muda o schema do banco, a autenticação e o
 > isolamento de dados. Ver seção "Modelo multi-tenant" abaixo — ela substitui qualquer
 > suposição de single-tenant que possa aparecer em código ou histórico anterior do projeto.
-> **O código-fonte atual (schema.sql e API routes) ainda NÃO reflete essa mudança** — foi
-> construído quando o projeto era single-tenant. Ver "Migração pendente" no fim deste arquivo.
+> **Atualização (schema.sql migrado):** `supabase/schema.sql` já foi reescrito no formato
+> multi-tenant (`organizations`, `profiles`, `org_id` em `events`, RLS por organização — ver
+> "Esboço do schema multi-tenant" abaixo). **As API routes ainda NÃO refletem essa mudança** —
+> `/api/participants/import` e `/api/certificates/generate` continuam assumindo uma única
+> organização implícita. Ver "Migração pendente" no fim deste arquivo para os próximos passos.
 
 ## O que é o projeto
 
@@ -115,7 +118,7 @@ Existem DOIS clientes Supabase no projeto e eles NÃO são intercambiáveis:
   antes de ler/escrever — não confiar apenas em RLS quando a rota usa `service_role`, já que
   essa chave ignora RLS por definição.
 
-## Esboço do schema multi-tenant (alvo — ver "Migração pendente" para o estado real do código)
+## Esboço do schema multi-tenant (já implementado em `supabase/schema.sql`)
 
 ```
 organizations
@@ -136,7 +139,7 @@ participants                      -- identidade GLOBAL, sem org_id de propósito
   id uuid pk
   full_name text
   cpf text null
-  email text (unique)
+  email text unique               -- constraint unique real no banco (não só índice)
   created_at
 
 events                            -- agora pertence a uma organização
@@ -170,14 +173,27 @@ validation_logs                   -- inalterado
 ### Estratégia de isolamento (RLS)
 
 - `profiles.org_id` é a fonte da verdade de "a qual organização este usuário pertence".
-- Policies em `events` (e por herança lógica, tudo que depende de `event_id`): um `org_admin`
-  só enxerga/edita linhas onde `events.org_id = (select org_id from profiles where id = auth.uid())`.
-  Um `platform_admin` enxerga tudo (policy adicional checando `role = 'platform_admin'`).
-- `participants`: leitura ampla é aceitável (é a identidade global), mas escrita/leitura de
-  dados sensíveis (CPF completo, por exemplo) deve continuar passando pelas API Routes com
-  mascaramento, como já documentado na seção de LGPD do PDF original.
+- As policies usam duas funções `security definer` (`current_profile_role()` e
+  `current_profile_org_id()`, definidas em `schema.sql`) em vez de fazer
+  `select ... from profiles` direto dentro da própria policy de `profiles` — consultar a mesma
+  tabela dentro da sua própria policy causa recursão infinita no Postgres. Reusar essas funções
+  em qualquer policy nova que precise saber role/organização do usuário logado.
+- Policies em `events` (e por herança lógica, tudo que depende de `event_id`, como
+  `inscriptions` e `certificates`): um `org_admin` só enxerga/edita linhas onde
+  `events.org_id = current_profile_org_id()`. Um `platform_admin` enxerga tudo.
+- `participants`: leitura ampla é aceitável para autenticados (é a identidade global), mas
+  escrita continua reservada às API Routes com `service_role` (que ignora RLS por definição) —
+  não há policy de `insert`/`update` para o client. Dados sensíveis (CPF completo, por exemplo)
+  devem continuar sendo mascarados nas API Routes, como já documentado na seção de LGPD do PDF
+  original. **Importante:** `participants.email` agora tem constraint `unique` no banco (é a
+  chave de identidade global) — `/api/participants/import` precisa virar um `upsert` (`on
+  conflict (email) do update`) em vez de `insert` puro, senão vai quebrar ao importar um CSV com
+  um e-mail que já existe de outra organização. Isso ainda não foi feito (ver item 3 da
+  Migração pendente).
 - `organizations`: qualquer usuário autenticado pode fazer `insert` (fluxo de self-serve).
   `select`/`update` restrito ao próprio `org_admin` daquela organização + `platform_admin`.
+- `validation_logs`: nenhuma policy para `authenticated`/`anon` — só a `service_role` acessa,
+  igual ao comportamento do schema single-tenant original.
 
 ## Estrutura do projeto
 
@@ -187,7 +203,7 @@ certifica-facil/
 ├── README.md                    ← passo a passo de setup (Supabase, deploy)
 ├── .env.example                 ← variáveis de ambiente necessárias (copiar para .env.local)
 ├── supabase/
-│   └── schema.sql                ← schema do Postgres — AINDA NO FORMATO SINGLE-TENANT, ver Migração pendente
+│   └── schema.sql                ← schema do Postgres, já no formato multi-tenant (organizations/profiles/RLS)
 └── src/
     ├── app/
     │   ├── page.tsx               ← home simples, aponta para /validar
@@ -259,21 +275,30 @@ Multi-tenant e os 3 níveis de login foram aprovados — isso NÃO reabre os ite
 
 ## Status atual do projeto
 
-### Feito e testado no formato single-tenant (build passa: `npm run build` ✅)
-- Schema do banco (versão single-tenant, sem `organizations`/`profiles`)
-- Rota de import de participantes via CSV (`/api/participants/import`)
-- Rota de geração de certificados em lote (`/api/certificates/generate`)
-- Rota de validação pública (`/api/validate`)
-- Página pública de validação (`/validar`)
-- Template visual do PDF (`CertificateTemplate.tsx`)
+### Feito
+- **Schema do banco no formato multi-tenant** (`supabase/schema.sql`): `organizations`,
+  `profiles` (com `role`/`org_id`/`participant_id`), `org_id` obrigatório em `events`,
+  `participants.email` com constraint `unique`, funções `security definer`
+  (`current_profile_role()`, `current_profile_org_id()`) e as policies de RLS descritas em
+  "Estratégia de isolamento" acima. **Ainda não rodado/testado contra um projeto Supabase
+  real** — só escrito e revisado, não aplicado via SQL Editor nem validado com dados de teste.
+- Rota de import de participantes via CSV (`/api/participants/import`) — build passa
+  (`npm run build` ✅), mas **ainda no formato single-tenant**: não resolve `org_id`, não filtra
+  por organização, e faz `insert` puro (vai quebrar contra o novo `participants.email unique`
+  ao reimportar um e-mail já existente — precisa virar `upsert`).
+- Rota de geração de certificados em lote (`/api/certificates/generate`) — idem, ainda
+  single-tenant, não valida `org_id` do evento.
+- Rota de validação pública (`/api/validate`) — não depende de organização, deve continuar
+  funcionando como está.
+- Página pública de validação (`/validar`).
+- Template visual do PDF (`CertificateTemplate.tsx`).
 
 ### Migração pendente para o modelo multi-tenant (prioridade atual)
-O código listado acima ainda assume uma única organização implícita. Antes de construir o
-dashboard, a ordem recomendada é:
+Schema já migrado (item 1 concluído). O restante do código ainda assume uma única organização
+implícita. Antes de construir o dashboard, a ordem recomendada é:
 
-1. **Atualizar `supabase/schema.sql`**: adicionar `organizations`, `profiles`, e a coluna
-   `org_id` em `events`; adicionar as policies de RLS descritas em "Estratégia de isolamento"
-   acima.
+1. ~~Atualizar `supabase/schema.sql`~~ ✅ feito — ver "Feito" acima. Falta rodar no SQL Editor
+   de um projeto Supabase real para validar que as policies funcionam como esperado.
 2. **Configurar Supabase Auth** no projeto (e-mail/senha ou magic link) e criar o fluxo de
    signup que cria `profiles` + `organizations` atomicamente (ver seção de self-serve acima).
    Recomendado usar uma função Postgres (`security definer`) ou uma API Route com
@@ -281,6 +306,8 @@ dashboard, a ordem recomendada é:
 3. **Atualizar `/api/participants/import` e `/api/certificates/generate`** para receberem o
    usuário autenticado, resolverem o `org_id` via `profiles`, e validarem que o `eventId`
    pertence àquela organização antes de agir (hoje essas rotas não checam organização nenhuma).
+   `/api/participants/import` também precisa trocar `insert` por `upsert` (`on conflict
+   (email) do update`) por causa da constraint `unique` nova em `participants.email`.
 4. **Dashboard do Org Admin** (`src/app/dashboard/`, hoje vazia):
    - Fluxo de onboarding (criar organização no primeiro login)
    - Formulário de criar/editar evento (já implicitamente escopado ao `org_id` do usuário)
@@ -311,8 +338,8 @@ npm run dev
 ```
 
 1. Criar projeto no supabase.com (free tier)
-2. Rodar `supabase/schema.sql` no SQL Editor (⚠️ hoje ainda na versão single-tenant — ver
-   "Migração pendente" antes de usar em produção)
+2. Rodar `supabase/schema.sql` no SQL Editor (já no formato multi-tenant; ⚠️ ainda não foi
+   validado contra um projeto Supabase real — ver "Migração pendente")
 3. Criar bucket `certificates` no Storage (pode ser privado)
 4. Copiar URL + anon key + service_role key para `.env.local`
 
